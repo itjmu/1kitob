@@ -58,6 +58,15 @@ class AdminChannel(StatesGroup):
     add = State()
 
 
+class AdminPremium(StatesGroup):
+    info = State()
+    grant = State()
+
+
+class ProfileEdit(StatesGroup):
+    contact = State()
+
+
 class Onboarding(StatesGroup):
     step = State()
 
@@ -134,7 +143,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS books (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
             title TEXT NOT NULL, author TEXT NOT NULL, city TEXT NOT NULL, condition TEXT NOT NULL DEFAULT '',
                     format TEXT NOT NULL DEFAULT 'Настоящая книга', deal_type TEXT NOT NULL DEFAULT 'Обменять',
-                    price TEXT, status TEXT NOT NULL DEFAULT 'available', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+                    price TEXT, status TEXT NOT NULL DEFAULT 'available', boosted INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS saved_searches (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
             query TEXT NOT NULL, format TEXT, city TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS exchange_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER NOT NULL,
@@ -147,6 +157,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS required_channels (id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id TEXT NOT NULL, title TEXT, invite_link TEXT);
         CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);
+        CREATE INDEX IF NOT EXISTS idx_books_boosted ON books(boosted);
         CREATE INDEX IF NOT EXISTS idx_books_status_created ON books(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_books_owner ON books(owner_id);
         CREATE INDEX IF NOT EXISTS idx_searches_active ON saved_searches(active, user_id);
@@ -163,6 +174,10 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN age INTEGER")
         if "favorite_genres" not in columns:
             db.execute("ALTER TABLE users ADD COLUMN favorite_genres TEXT")
+        if "is_premium" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0")
+        if "preferred_contact" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN preferred_contact TEXT")
         columns = {row[1] for row in db.execute("PRAGMA table_info(books)")}
         if "format" not in columns:
             db.execute("ALTER TABLE books ADD COLUMN format TEXT NOT NULL DEFAULT 'Настоящая книга'")
@@ -172,6 +187,8 @@ def init_db():
             db.execute("ALTER TABLE books ADD COLUMN deal_type TEXT NOT NULL DEFAULT 'Обменять'")
         if "price" not in columns:
             db.execute("ALTER TABLE books ADD COLUMN price TEXT")
+        if "boosted" not in columns:
+            db.execute("ALTER TABLE books ADD COLUMN boosted INTEGER NOT NULL DEFAULT 0")
         columns = {row[1] for row in db.execute("PRAGMA table_info(exchange_requests)")}
         if "owner_consent" not in columns:
             db.execute("ALTER TABLE exchange_requests ADD COLUMN owner_consent INTEGER NOT NULL DEFAULT 0")
@@ -214,6 +231,22 @@ def banned(user_id):
     with closing(connect()) as db:
         row = db.execute("SELECT is_banned FROM users WHERE telegram_id=?", (user_id,)).fetchone()
     return bool(row and row["is_banned"])
+
+
+def is_premium_user(user_id):
+    """Админ всегда считается премиум-пользователем без записи в базе."""
+    if is_admin(user_id):
+        return True
+    with closing(connect()) as db:
+        row = db.execute("SELECT is_premium FROM users WHERE telegram_id=?", (user_id,)).fetchone()
+    return bool(row and row["is_premium"])
+
+
+def format_contact(user_id, username, name, preferred_contact, is_premium_flag):
+    """Показывает свой указанный контакт премиум-пользователю/админу, иначе — Telegram username."""
+    if (is_admin(user_id) or is_premium_flag) and preferred_contact:
+        return escape(str(preferred_contact))
+    return f"@{username or name}"
 
 
 # --- Настройки бота (ключ-значение) и обязательная подписка на каналы ---
@@ -296,13 +329,28 @@ def keyboard(user_id=None):
     rows = [
         [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="🔍 Поиск")],
         [KeyboardButton(text="📚 Каталог"), KeyboardButton(text="🔎 Ищут")],
-        [KeyboardButton(text="📖 Мои книги"), KeyboardButton(text="🔔 Мои поиски")],
-        [KeyboardButton(text="🤝 Заявки"), KeyboardButton(text="🚩 Жалоба")],
-        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text=MENU_TEXT)],
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="ℹ️ Помощь")],
     ]
     if user_id is not None and is_admin(user_id):
         rows.append([KeyboardButton(text="⚙ Админка")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def profile_keyboard(user_id):
+    premium = is_premium_user(user_id)
+    rows = [
+        [InlineKeyboardButton(text="📖 Мои книги", callback_data="profile:books")],
+        [InlineKeyboardButton(text="🔔 Мои поиски", callback_data="profile:searches")],
+        [InlineKeyboardButton(text="🤝 Мои заявки", callback_data="profile:requests")],
+        [InlineKeyboardButton(text="🚩 Пожаловаться на пользователя", callback_data="profile:report")],
+    ]
+    if premium:
+        rows.append([InlineKeyboardButton(text="✏ Контакт для показа", callback_data="profile:contact")])
+        rows.append([InlineKeyboardButton(text="⭐ Премиум (активен)", callback_data="profile:premium")])
+    else:
+        rows.append([InlineKeyboardButton(text="⭐ Получить премиум", callback_data="profile:premium")])
+    rows.append([InlineKeyboardButton(text="⌂ Меню", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_keyboard():
@@ -393,6 +441,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"), InlineKeyboardButton(text="🚩 Жалобы", callback_data="admin:reports")],
         [InlineKeyboardButton(text="🔎 Поиски", callback_data="admin:searches")],
         [InlineKeyboardButton(text="📢 Подписка на каналы", callback_data="admin:subscriptions")],
+        [InlineKeyboardButton(text="⭐ Премиум", callback_data="admin:premium")],
         [InlineKeyboardButton(text="📣 Рассылка", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="✕ Закрыть", callback_data="admin:close")],
     ])
@@ -520,7 +569,11 @@ async def onboarding_start(message: Message, state: FSMContext):
 
 async def help_message(message: Message):
     if await allowed(message):
-        await message.answer("➕ Добавьте книгу. 🔍 Ищите по названию или автору.\nЗаявки анонимны до взаимного согласия.\n\n⌂ Меню — главный экран.", reply_markup=back_keyboard())
+        await message.answer(
+            "➕ Добавьте книгу. 🔍 Ищите по названию или автору.\n"
+            "Заявки анонимны до взаимного согласия.\n\n"
+            "👤 В разделе «Мой профиль» — ваши книги, поиски, заявки, жалобы и премиум-функции.\n\n"
+            "⌂ Меню — главный экран.", reply_markup=back_keyboard())
 
 
 async def add_start(message, state):
@@ -616,6 +669,12 @@ async def add_deal(message, state):
     if not deal:
         await message.answer("Выберите вариант кнопкой.")
         return
+    if "Продать" in deal and not is_premium_user(message.from_user.id):
+        await message.answer(
+            "💳 Продажа книг доступна только премиум-пользователям.\n"
+            "Выберите «Подарить» или «Обменять», либо оформите премиум в разделе «👤 Мой профиль».",
+            reply_markup=deal_keyboard())
+        return
     await state.update_data(deal_type=deal)
     if "Продать" in deal:
         await state.set_state(AddBook.price)
@@ -659,7 +718,7 @@ async def search_query(message, state):
     query = data["query"].casefold()
     save_session(message.from_user.id, action="search_query", query=data["query"], state="")
     with closing(connect()) as db:
-        candidates = db.execute("SELECT id,title,author,format FROM books WHERE status='available' AND owner_id!=? ORDER BY created_at DESC", (message.from_user.id,)).fetchall()
+        candidates = db.execute("SELECT id,title,author,format,boosted FROM books WHERE status='available' AND owner_id!=? ORDER BY boosted DESC, created_at DESC", (message.from_user.id,)).fetchall()
         books = [book for book in candidates if query in book["title"].casefold() or query in book["author"].casefold()][:50]
     if not books:
         with closing(connect()) as db:
@@ -671,13 +730,13 @@ async def search_query(message, state):
     await state.update_data(found_book_ids=[book["id"] for book in books])
     await state.set_state(SearchBook.browsing)
     await message.answer("Выберите книгу:", reply_markup=keyboard(message.from_user.id))
-    await message.answer("\n".join(f"№ {book['id']} · {book['title']} · {book['author']}" for book in books),
+    await message.answer("\n".join(f"{'⭐ ' if book['boosted'] else ''}№ {book['id']} · {book['title']} · {book['author']}" for book in books),
                          reply_markup=catalog_keyboard([book["id"] for book in books], 0, 1))
 
 
 async def all_books(message):
     if not await allowed(message): return
-    with closing(connect()) as db: rows = db.execute("SELECT * FROM books WHERE status='available' ORDER BY created_at DESC").fetchall()
+    with closing(connect()) as db: rows = db.execute("SELECT * FROM books WHERE status='available' ORDER BY boosted DESC, created_at DESC").fetchall()
     if not rows:
         await message.answer("Каталог пока пуст.", reply_markup=keyboard(message.from_user.id))
         return
@@ -690,7 +749,7 @@ async def show_catalog(target, rows, page=0):
     page = max(0, min(page, total_pages - 1))
     selected = rows[page * page_size:(page + 1) * page_size]
     text = f"📚 Каталог · страница {page + 1}/{total_pages}\n\n" + "\n".join(
-        f"№ {book['id']} · {book['title']} · {book['author']}" for book in selected
+        f"{'⭐ ' if book['boosted'] else ''}№ {book['id']} · {book['title']} · {book['author']}" for book in selected
     )
     markup = catalog_keyboard([book["id"] for book in selected], page, total_pages)
     if isinstance(target, CallbackQuery):
@@ -702,7 +761,7 @@ async def show_catalog(target, rows, page=0):
 async def catalog_page_callback(callback: CallbackQuery):
     await callback.answer()
     with closing(connect()) as db:
-        rows = db.execute("SELECT * FROM books WHERE status='available' ORDER BY created_at DESC").fetchall()
+        rows = db.execute("SELECT * FROM books WHERE status='available' ORDER BY boosted DESC, created_at DESC").fetchall()
     await show_catalog(callback, rows, int(callback.data.split(":", 1)[1]))
 
 
@@ -745,15 +804,13 @@ async def show_tour_step(callback: CallbackQuery, state: FSMContext, step: int):
     """Показать определённый шаг туториала"""
     tour_texts = [
         "🎯 <b>Шаг 1: Главное меню</b>\n\n"
-        "В главном меню вы видите 8 основных кнопок:\n\n"
+        "В главном меню — 6 кнопок:\n\n"
         "• <b>➕ Добавить</b> - опубликовать свою книгу\n"
         "• <b>🔍 Поиск</b> - найти нужную книгу\n"
         "• <b>📚 Каталог</b> - просмотреть все книги\n"
         "• <b>🔎 Ищут</b> - вижу что ищут люди\n"
-        "• <b>📖 Мои книги</b> - ваши опубликованные книги\n"
-        "• <b>🔔 Мои поиски</b> - сохранённые поиски\n"
-        "• <b>🤝 Заявки</b> - запросы на обмен\n"
-        "• <b>🚩 Жалоба</b> - пожаловаться на проблемы",
+        "• <b>👤 Мой профиль</b> - ваши книги, поиски, заявки, жалобы и премиум\n"
+        "• <b>ℹ️ Помощь</b> - краткая подсказка",
         
         "📚 <b>Шаг 2: Добавление книги</b>\n\n"
         "При добавлении книги вы указываете:\n\n"
@@ -761,7 +818,7 @@ async def show_tour_step(callback: CallbackQuery, state: FSMContext, step: int):
         "• Формат (бумажная, аудио, видео, PDF)\n"
         "• Для бумажной - город\n"
         "• Состояние книги\n"
-        "• Как предложить (подарить, обменять, продать)\n"
+        "• Как предложить (подарить, обменять, продать — продажа только для премиум)\n"
         "• Цену (если продаёте)\n"
         "• Фото книги\n\n"
         "✨ Совет: <i>Хорошее фото привлекает больше внимания!</i>",
@@ -937,16 +994,64 @@ async def menu_callback(callback: CallbackQuery):
     await callback.message.answer("BookHub — книги и обмены", reply_markup=keyboard(callback.from_user.id))
 
 
-async def my_books(message):
-    if not await allowed(message): return
-    with closing(connect()) as db: rows = db.execute("SELECT * FROM books WHERE owner_id=? ORDER BY created_at DESC", (message.from_user.id,)).fetchall()
-    await message.answer("Книг нет." if not rows else "\n\n".join(f"#{x['id']} · {x['title']} · {x['author']}\n/delete_book_{x['id']}" for x in rows), reply_markup=back_keyboard())
+async def my_books(target, user_id):
+    with closing(connect()) as db:
+        rows = db.execute("SELECT * FROM books WHERE owner_id=? AND status!='deleted' ORDER BY created_at DESC", (user_id,)).fetchall()
+    if not rows:
+        await target.answer("У вас пока нет книг.")
+        return
+    premium = is_premium_user(user_id)
+    for book in rows:
+        buttons = [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"mybook_del:{book['id']}")]
+        if premium and book["status"] == "available":
+            boost_text = "⬇ Убрать из топа" if book["boosted"] else "🚀 Поднять в топ"
+            buttons.append(InlineKeyboardButton(text=boost_text, callback_data=f"mybook_boost:{book['id']}"))
+        note = "" if book["status"] == "available" else " · неактивна"
+        star = "⭐ " if book["boosted"] else ""
+        await target.answer(f"{star}#{book['id']} · {book['title']} · {book['author']}{note}",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[buttons]))
 
 
-async def my_searches(message):
-    if not await allowed(message): return
-    with closing(connect()) as db: rows = db.execute("SELECT * FROM saved_searches WHERE user_id=? AND active=1", (message.from_user.id,)).fetchall()
-    await message.answer("\n".join(f"🔔 {x['query']}" for x in rows) or "Поисков нет.", reply_markup=back_keyboard())
+async def my_searches(target, user_id):
+    with closing(connect()) as db:
+        rows = db.execute("SELECT * FROM saved_searches WHERE user_id=? AND active=1", (user_id,)).fetchall()
+    await target.answer("\n".join(f"🔔 {x['query']}" for x in rows) or "Поисков нет.")
+
+
+async def mybook_delete_callback(callback: CallbackQuery):
+    await callback.answer()
+    book_id = int(callback.data.split(":", 1)[1])
+    with closing(connect()) as db:
+        row = db.execute("SELECT owner_id FROM books WHERE id=?", (book_id,)).fetchone()
+        if not row or row["owner_id"] != callback.from_user.id:
+            await callback.message.answer("Книга не найдена.")
+            return
+        db.execute("UPDATE books SET status='deleted' WHERE id=?", (book_id,))
+        db.commit()
+    await safe_edit(callback.message.edit_reply_markup(reply_markup=None))
+    await callback.message.answer("Книга удалена.")
+
+
+async def mybook_boost_callback(callback: CallbackQuery):
+    await callback.answer()
+    book_id = int(callback.data.split(":", 1)[1])
+    if not is_premium_user(callback.from_user.id):
+        await callback.message.answer("Поднятие в топ каталога доступно только премиум-пользователям.")
+        return
+    with closing(connect()) as db:
+        row = db.execute("SELECT owner_id, boosted FROM books WHERE id=? AND status='available'", (book_id,)).fetchone()
+        if not row or row["owner_id"] != callback.from_user.id:
+            await callback.message.answer("Книга не найдена.")
+            return
+        new_value = 0 if row["boosted"] else 1
+        db.execute("UPDATE books SET boosted=? WHERE id=?", (new_value, book_id))
+        db.commit()
+    boost_text = "⬇ Убрать из топа" if new_value else "🚀 Поднять в топ"
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"mybook_del:{book_id}"),
+        InlineKeyboardButton(text=boost_text, callback_data=f"mybook_boost:{book_id}"),
+    ]])
+    await safe_edit(callback.message.edit_reply_markup(reply_markup=markup))
 
 
 async def request_book(message, bot):
@@ -1060,7 +1165,9 @@ async def counter_accept_callback(callback: CallbackQuery, bot: Bot):
     with closing(connect()) as db:
         row = db.execute("""SELECT er.*, b.title, b.owner_id,
             requester.username AS requester_username, requester.name AS requester_name,
-            owner.username AS owner_username, owner.name AS owner_name
+            requester.preferred_contact AS requester_contact, requester.is_premium AS requester_is_premium,
+            owner.username AS owner_username, owner.name AS owner_name,
+            owner.preferred_contact AS owner_contact, owner.is_premium AS owner_is_premium
             FROM exchange_requests er JOIN books b ON b.id=er.book_id
             JOIN users requester ON requester.telegram_id=er.requester_id
             JOIN users owner ON owner.telegram_id=b.owner_id WHERE er.id=?""", (request_id,)).fetchone()
@@ -1071,8 +1178,10 @@ async def counter_accept_callback(callback: CallbackQuery, bot: Bot):
         db.commit()
     await safe_edit(callback.message.edit_reply_markup(reply_markup=None))
     await callback.message.answer("✅ Обмен принят. Контакты раскрыты обеим сторонам.")
-    await bot.send_message(row["owner_id"], f"Контакт отправителя: @{row['requester_username'] or row['requester_name']}")
-    await bot.send_message(row["requester_id"], f"Контакт владельца: @{row['owner_username'] or row['owner_name']}")
+    owner_contact = format_contact(row["owner_id"], row["owner_username"], row["owner_name"], row["owner_contact"], row["owner_is_premium"])
+    requester_contact = format_contact(row["requester_id"], row["requester_username"], row["requester_name"], row["requester_contact"], row["requester_is_premium"])
+    await bot.send_message(row["owner_id"], f"Контакт отправителя: {requester_contact}")
+    await bot.send_message(row["requester_id"], f"Контакт владельца: {owner_contact}")
 
 
 async def accept_request(message, bot):
@@ -1080,15 +1189,19 @@ async def accept_request(message, bot):
     with closing(connect()) as db:
         row = db.execute("""SELECT er.*, b.title, b.owner_id,
             requester.username AS requester_username, requester.name AS requester_name,
-            owner.username AS owner_username, owner.name AS owner_name
+            requester.preferred_contact AS requester_contact, requester.is_premium AS requester_is_premium,
+            owner.username AS owner_username, owner.name AS owner_name,
+            owner.preferred_contact AS owner_contact, owner.is_premium AS owner_is_premium
             FROM exchange_requests er JOIN books b ON b.id=er.book_id
             JOIN users requester ON requester.telegram_id=er.requester_id
             JOIN users owner ON owner.telegram_id=b.owner_id WHERE er.id=?""", (request_id,)).fetchone()
         if not row or row["owner_id"] != message.from_user.id: await message.answer("Заявка не найдена."); return
         db.execute("UPDATE exchange_requests SET owner_consent=1,status='accepted' WHERE id=?", (request_id,)); db.commit()
+    owner_contact = format_contact(row["owner_id"], row["owner_username"], row["owner_name"], row["owner_contact"], row["owner_is_premium"])
+    requester_contact = format_contact(row["requester_id"], row["requester_username"], row["requester_name"], row["requester_contact"], row["requester_is_premium"])
     await message.answer("Вы согласились. Контакты раскрыты, так как автор заявки уже согласился.")
-    await bot.send_message(row["requester_id"], f"✅ Владелец согласился на обмен «{row['title']}». Контакты:\nВладелец: @{row['owner_username'] or row['owner_name']}")
-    await bot.send_message(message.from_user.id, f"Контакт автора заявки на «{row['title']}»:\n@{row['requester_username'] or row['requester_name']}")
+    await bot.send_message(row["requester_id"], f"✅ Владелец согласился на обмен «{row['title']}». Контакты:\nВладелец: {owner_contact}")
+    await bot.send_message(message.from_user.id, f"Контакт автора заявки на «{row['title']}»:\n{requester_contact}")
 
 
 async def accept_callback(callback: CallbackQuery, bot: Bot):
@@ -1100,7 +1213,9 @@ async def accept_callback(callback: CallbackQuery, bot: Bot):
     with closing(connect()) as db:
         row = db.execute("""SELECT er.*, b.title, b.owner_id,
             requester.username AS requester_username, requester.name AS requester_name,
-            owner.username AS owner_username, owner.name AS owner_name
+            requester.preferred_contact AS requester_contact, requester.is_premium AS requester_is_premium,
+            owner.username AS owner_username, owner.name AS owner_name,
+            owner.preferred_contact AS owner_contact, owner.is_premium AS owner_is_premium
             FROM exchange_requests er JOIN books b ON b.id=er.book_id
             JOIN users requester ON requester.telegram_id=er.requester_id
             JOIN users owner ON owner.telegram_id=b.owner_id WHERE er.id=?""", (request_id,)).fetchone()
@@ -1109,9 +1224,11 @@ async def accept_callback(callback: CallbackQuery, bot: Bot):
             return
         db.execute("UPDATE exchange_requests SET owner_consent=1,status='accepted' WHERE id=?", (request_id,)); db.commit()
     await safe_edit(callback.message.edit_reply_markup(reply_markup=None))
+    owner_contact = format_contact(row["owner_id"], row["owner_username"], row["owner_name"], row["owner_contact"], row["owner_is_premium"])
+    requester_contact = format_contact(row["requester_id"], row["requester_username"], row["requester_name"], row["requester_contact"], row["requester_is_premium"])
     await callback.message.answer("Вы согласились. Контакты раскрыты обеим сторонам.")
-    await bot.send_message(row["requester_id"], f"✅ Владелец согласился на обмен «{row['title']}».\nКонтакт владельца: @{row['owner_username'] or row['owner_name']}")
-    await bot.send_message(callback.from_user.id, f"Контакт автора заявки:\n@{row['requester_username'] or row['requester_name']}")
+    await bot.send_message(row["requester_id"], f"✅ Владелец согласился на обмен «{row['title']}».\nКонтакт владельца: {owner_contact}")
+    await bot.send_message(callback.from_user.id, f"Контакт автора заявки:\n{requester_contact}")
 
 
 async def decline_request(message):
@@ -1137,14 +1254,94 @@ async def decline_callback(callback: CallbackQuery, bot: Bot):
             pass
 
 
-async def my_requests(message):
-    if not await allowed(message): return
-    with closing(connect()) as db: rows = db.execute("SELECT er.id,er.status,b.title FROM exchange_requests er JOIN books b ON b.id=er.book_id WHERE er.requester_id=? OR b.owner_id=?", (message.from_user.id, message.from_user.id)).fetchall()
-    await message.answer("\n".join(f"🤝 №{x['id']} «{x['title']}» — {x['status']}" for x in rows) or "Заявок нет.")
+async def my_requests(target, user_id):
+    with closing(connect()) as db:
+        rows = db.execute("SELECT er.id,er.status,b.title FROM exchange_requests er JOIN books b ON b.id=er.book_id WHERE er.requester_id=? OR b.owner_id=?", (user_id, user_id)).fetchall()
+    await target.answer("\n".join(f"🤝 №{x['id']} «{x['title']}» — {x['status']}" for x in rows) or "Заявок нет.")
 
 
-async def report_start(message, state):
-    if await allowed(message): await state.set_state(ReportUser.target); await message.answer("Введите Telegram ID нарушителя:")
+# --- Профиль пользователя (личный кабинет) ---
+
+async def profile_start(message: Message):
+    if not await allowed(message):
+        return
+    await message.answer("👤 Ваш профиль:", reply_markup=profile_keyboard(message.from_user.id))
+
+
+async def premium_info(target, user_id):
+    premium = is_premium_user(user_id)
+    text = "⭐ <b>Премиум</b>\n\n"
+    if premium:
+        text += ("У вас активен премиум. Доступно:\n"
+                 "• Продажа книг за деньги\n"
+                 "• Поднятие своих книг в топ каталога\n"
+                 "• Свой контакт для показа вместо Telegram-аккаунта")
+        await target.answer(text, parse_mode=ParseMode.HTML)
+        return
+    info_text = get_setting("premium_info", "Информация об оформлении премиума скоро появится. Обратитесь к администратору.")
+    text += ("Премиум даёт:\n"
+             "• Продажу книг за деньги\n"
+             "• Поднятие своих книг в топ каталога\n"
+             "• Свой контакт для показа вместо Telegram-аккаунта\n\n") + info_text
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил, сообщить админу", callback_data="premium_notify")]])
+    await target.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+async def premium_notify_callback(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Заявка отправлена администратору.", show_alert=True)
+    user = callback.from_user
+    for admin_id in admins():
+        try:
+            await bot.send_message(
+                admin_id,
+                f"⭐ Пользователь @{user.username or user.full_name} (ID: {user.id}) хочет оформить премиум.\n"
+                f"Чтобы выдать: ⚙ Админка → ⭐ Премиум → «Выдать/забрать премиум» → отправьте {user.id}"
+            )
+        except Exception:
+            pass
+
+
+async def profile_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if banned(callback.from_user.id):
+        await callback.message.answer("Ваш аккаунт заблокирован администратором.")
+        return
+    action = callback.data.split(":", 1)[1]
+    if action == "books":
+        await my_books(callback.message, callback.from_user.id)
+    elif action == "searches":
+        await my_searches(callback.message, callback.from_user.id)
+    elif action == "requests":
+        await my_requests(callback.message, callback.from_user.id)
+    elif action == "report":
+        await state.set_state(ReportUser.target)
+        await callback.message.answer("Введите Telegram ID нарушителя:")
+    elif action == "premium":
+        await premium_info(callback.message, callback.from_user.id)
+    elif action == "contact":
+        if not is_premium_user(callback.from_user.id):
+            await callback.message.answer("Эта функция доступна только премиум-пользователям.")
+            return
+        await state.set_state(ProfileEdit.contact)
+        await callback.message.answer(
+            "Отправьте текст, юзернейм или ссылку, которые будут показываться собеседнику вместо вашего "
+            "Telegram-аккаунта при взаимном раскрытии контактов:",
+            reply_markup=back_keyboard())
+
+
+async def profile_contact_save(message, state):
+    if not is_premium_user(message.from_user.id):
+        await state.clear()
+        return
+    contact = (message.text or "").strip()
+    if not contact:
+        await message.answer("Отправьте текст контакта.")
+        return
+    with closing(connect()) as db:
+        db.execute("UPDATE users SET preferred_contact=? WHERE telegram_id=?", (contact, message.from_user.id))
+        db.commit()
+    await state.clear()
+    await message.answer("✅ Контакт для показа обновлён.", reply_markup=keyboard(message.from_user.id))
 
 
 async def report_book_callback(callback: CallbackQuery, state: FSMContext):
@@ -1190,6 +1387,7 @@ async def admin_stats(message, admin_id=None):
         searches = db.execute("SELECT COUNT(*) FROM saved_searches WHERE active=1").fetchone()[0]
         requests = db.execute("SELECT COUNT(*) FROM exchange_requests").fetchone()[0]
         reports_count = db.execute("SELECT COUNT(*) FROM reports WHERE status='new'").fetchone()[0]
+        premium_count = db.execute("SELECT COUNT(*) FROM users WHERE is_premium=1").fetchone()[0]
         
         # Статистика по полу
         male = db.execute("SELECT COUNT(*) FROM users WHERE gender='male'").fetchone()[0]
@@ -1219,7 +1417,8 @@ async def admin_stats(message, admin_id=None):
     text += f"📚 Книги: {books}\n"
     text += f"🔎 Поиски: {searches}\n"
     text += f"🤝 Заявки: {requests}\n"
-    text += f"🚩 Жалобы: {reports_count}\n\n"
+    text += f"🚩 Жалобы: {reports_count}\n"
+    text += f"⭐ Премиум (не считая админов): {premium_count}\n\n"
     
     text += f"<b>Гендерное распределение:</b>\n"
     if users > 0:
@@ -1295,6 +1494,16 @@ async def admin_callback(callback: CallbackQuery, state: FSMContext):
         await admin_channels_menu(callback.message, callback.from_user.id)
     elif action == "close_channels":
         await safe_edit(callback.message.edit_reply_markup(reply_markup=None))
+    elif action == "premium":
+        await admin_premium_menu(callback.message, callback.from_user.id)
+    elif action == "close_premium":
+        await safe_edit(callback.message.edit_reply_markup(reply_markup=None))
+    elif action == "premium_info":
+        await state.set_state(AdminPremium.info)
+        await callback.message.answer("Пришлите новый текст условий оплаты (можно со ссылкой):", reply_markup=back_keyboard())
+    elif action == "premium_grant":
+        await state.set_state(AdminPremium.grant)
+        await callback.message.answer("Пришлите Telegram ID пользователя — статус переключится (выдан ⇄ снят):", reply_markup=back_keyboard())
     elif action == "toggle_sub":
         set_setting("subscription_required", "0" if subscription_required() else "1")
         await admin_channels_menu(callback.message, callback.from_user.id)
@@ -1488,6 +1697,68 @@ async def admin_channel_add_save(message, state):
     await message.answer(f"✅ Канал «{chat.title}» добавлен.", reply_markup=admin_menu_keyboard())
 
 
+def admin_premium_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏ Изменить условия оплаты", callback_data="admin:premium_info")],
+        [InlineKeyboardButton(text="🎁 Выдать/забрать премиум", callback_data="admin:premium_grant")],
+        [InlineKeyboardButton(text="‹ Назад", callback_data="admin:close_premium")],
+    ])
+
+
+async def admin_premium_menu(message, admin_id=None):
+    if not is_admin(admin_id or message.from_user.id):
+        return
+    with closing(connect()) as db:
+        premium_count = db.execute("SELECT COUNT(*) FROM users WHERE is_premium=1").fetchone()[0]
+    info_text = get_setting("premium_info", "не задано")
+    text = ("⭐ <b>Премиум</b>\n\n"
+            f"Премиум-пользователей в базе: {premium_count} (админы всегда премиум автоматически)\n\n"
+            f"Текущие условия оплаты, которые видят пользователи:\n{info_text}")
+    await message.answer(text, reply_markup=admin_premium_keyboard(), parse_mode=ParseMode.HTML)
+
+
+async def admin_premium_info_save(message, state):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Пришлите текст с условиями оплаты (можно со ссылкой).")
+        return
+    set_setting("premium_info", text)
+    await state.clear()
+    await message.answer("✅ Условия оплаты обновлены.", reply_markup=admin_menu_keyboard())
+
+
+async def admin_premium_grant_save(message, state):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("Нужен числовой Telegram ID пользователя.")
+        return
+    user_id = int(text)
+    with closing(connect()) as db:
+        row = db.execute("SELECT is_premium FROM users WHERE telegram_id=?", (user_id,)).fetchone()
+        if not row:
+            await message.answer("Пользователь с таким ID ещё не писал боту.")
+            return
+        new_value = 0 if row["is_premium"] else 1
+        db.execute("UPDATE users SET is_premium=? WHERE telegram_id=?", (new_value, user_id))
+        db.commit()
+    await state.clear()
+    result_text = "выдан ✅" if new_value else "снят ❌"
+    await message.answer(f"Премиум для {user_id} {result_text}.", reply_markup=admin_menu_keyboard())
+    try:
+        if new_value:
+            await message.bot.send_message(user_id, "🎉 Вам выдан премиум! Загляните в «👤 Мой профиль», чтобы увидеть новые возможности.")
+        else:
+            await message.bot.send_message(user_id, "Ваш премиум-статус был снят администратором.")
+    except Exception:
+        pass
+
+
 async def noop_callback(callback: CallbackQuery):
     await callback.answer()
 
@@ -1594,6 +1865,21 @@ async def go_menu(message, state):
     await start(message, state)
 
 
+async def fallback_message(message: Message, state: FSMContext):
+    """Ловит любые сообщения/команды, которые не подошли ни под один другой обработчик:
+    показывает меню, либо просит завершить анкету, либо просит подписаться (если это включено)."""
+    if not await allowed(message):
+        return
+    with closing(connect()) as db:
+        user = db.execute("SELECT onboarded FROM users WHERE telegram_id=?", (message.from_user.id,)).fetchone()
+    if user and not user["onboarded"]:
+        await state.set_state(Onboarding.step)
+        await state.update_data(step=0)
+        await onboarding_start(message, state)
+        return
+    await message.answer("Не совсем понял вас 🙂 Вот главное меню:", reply_markup=keyboard(message.from_user.id))
+
+
 async def main():
     load_dotenv(BASE_DIR / ".env")
     token = os.getenv("BOT_TOKEN")
@@ -1603,7 +1889,7 @@ async def main():
     dp.message.register(start, CommandStart()); dp.message.register(go_menu, F.text.in_({MENU_TEXT, BACK_TEXT, "❌ Отмена"})); dp.message.register(cancel, Command("cancel")); dp.message.register(help_message, F.text == "ℹ️ Помощь")
     dp.message.register(add_start, F.text.in_({"➕ Добавить", "➕ Добавить книгу"})); dp.message.register(search_start, F.text.in_({"🔍 Поиск", "🔍 Найти книгу"}))
     dp.message.register(all_books, F.text.in_({"📚 Каталог", "📚 Книги пользователей"})); dp.message.register(all_searches, F.text.in_({"🔎 Ищут", "🔎 Что ищут"}))
-    dp.message.register(my_books, F.text == "📖 Мои книги"); dp.message.register(my_searches, F.text == "🔔 Мои поиски"); dp.message.register(my_requests, F.text.in_({"🤝 Заявки", "🤝 Мои заявки"})); dp.message.register(report_start, F.text.in_({"🚩 Жалоба", "🚩 Пожаловаться"}))
+    dp.message.register(profile_start, F.text == "👤 Мой профиль")
     dp.message.register(admin, F.text == "⚙ Админка")
     dp.message.register(admin, Command("admin")); dp.message.register(admin_books, Command("admin_books")); dp.message.register(admin_users, Command("admin_users")); dp.message.register(reports, Command("reports"))
     dp.message.register(report_reason, ReportUser.reason); dp.message.register(report_target, ReportUser.target)
@@ -1613,6 +1899,9 @@ async def main():
     dp.message.register(admin_broadcast_send, AdminBroadcast.message)
     dp.message.register(admin_edit_save, AdminEdit.book)
     dp.message.register(admin_channel_add_save, AdminChannel.add)
+    dp.message.register(admin_premium_info_save, AdminPremium.info)
+    dp.message.register(admin_premium_grant_save, AdminPremium.grant)
+    dp.message.register(profile_contact_save, ProfileEdit.contact)
     dp.message.register(book_by_id, F.text.regexp(r"^\d+$"))
     dp.callback_query.register(request_callback, F.data.startswith("request:"))
     dp.callback_query.register(request_callback, F.data.startswith("buy:"))
@@ -1634,10 +1923,16 @@ async def main():
     dp.callback_query.register(admin_callback, F.data.startswith("admin:"))
     dp.callback_query.register(check_subs_callback, F.data == "check_subs")
     dp.callback_query.register(noop_callback, F.data == "noop")
+    dp.callback_query.register(profile_callback, F.data.startswith("profile:"))
+    dp.callback_query.register(premium_notify_callback, F.data == "premium_notify")
+    dp.callback_query.register(mybook_delete_callback, F.data.startswith("mybook_del:"))
+    dp.callback_query.register(mybook_boost_callback, F.data.startswith("mybook_boost:"))
     dp.message.register(request_book, F.text.regexp(r"^/request_\d+$")); dp.message.register(accept_request, F.text.regexp(r"^/accept_\d+$")); dp.message.register(decline_request, F.text.regexp(r"^/decline_\d+$")); dp.message.register(delete_book, F.text.regexp(r"^/delete_book_\d+$")); dp.message.register(ban_action, F.text.regexp(r"^/(?:ban|unban)_\d+$"))
     dp.message.register(delete_user, F.text.regexp(r"^/delete_user_\d+$"))
     dp.message.register(edit_book, F.text.regexp(r"^/edit_book_\d+ .+"))
     dp.message.register(admin_stats, Command("stats")); dp.message.register(admin_broadcast_start, Command("broadcast"))
+    # Обязательно регистрируем последним: ловит все сообщения, не подошедшие ни под один обработчик выше.
+    dp.message.register(fallback_message)
     try:
         await bot.get_updates(offset=-1, timeout=0)
         await dp.start_polling(bot)

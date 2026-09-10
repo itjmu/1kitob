@@ -1,0 +1,3 @@
+bot.instance.lock
+books.sqlite3
+.env
