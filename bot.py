@@ -546,7 +546,9 @@ async def start(message: Message, state: FSMContext):
             await onboarding_start(message, state)
         else:
             save_session(message.from_user.id, action="menu")
-            await message.answer("BookHub — книги и обмены", reply_markup=keyboard(message.from_user.id))
+            hour = time.localtime().tm_hour
+            greet = "🌅 Доброе утро" if 5 <= hour < 12 else "🏞 Добрый день" if 12 <= hour < 18 else "🌉 Добрый вечер" if 18 <= hour < 23 else "🌃 Доброй ночи"
+            await message.answer(f"{greet}, {message.from_user.first_name}! 👋", reply_markup=keyboard(message.from_user.id))
 
 
 async def onboarding_start(message: Message, state: FSMContext):
@@ -705,6 +707,9 @@ async def add_photo(message, state, bot):
                  (message.from_user.id, data["title"], data["author"], data["city"], data["condition"], data["book_format"], data["photo_id"], data["deal_type"], data.get("price")))
         book = db.execute("SELECT * FROM books WHERE id=?", (cur.lastrowid,)).fetchone(); db.commit()
     await state.clear(); await notify_matches(bot, book); await message.answer("✅ Книга опубликована.", reply_markup=keyboard(message.from_user.id))
+    for admin_id in admins():
+        try: await bot.send_message(admin_id, f"📚 Новая книга от {message.from_user.first_name}: «{book['title']}» ({book['format']})")
+        except Exception: pass
 
 
 async def search_start(message, state):
@@ -719,7 +724,8 @@ async def search_query(message, state):
     save_session(message.from_user.id, action="search_query", query=data["query"], state="")
     with closing(connect()) as db:
         candidates = db.execute("SELECT id,title,author,format,boosted FROM books WHERE status='available' AND owner_id!=? ORDER BY boosted DESC, created_at DESC", (message.from_user.id,)).fetchall()
-        books = [book for book in candidates if query in book["title"].casefold() or query in book["author"].casefold()][:50]
+        words = [w for w in query.split() if w]
+        books = [book for book in candidates if words and all(w in book["title"].casefold() or w in book["author"].casefold() for w in words)][:50]
     if not books:
         with closing(connect()) as db:
             db.execute("INSERT INTO saved_searches (user_id,query,format,city) VALUES (?,?,?,?)", (message.from_user.id, data["query"], None, None))
